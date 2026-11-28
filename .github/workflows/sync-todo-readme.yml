@@ -1,0 +1,133 @@
+name: Sync README TODOs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-todo-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Update README TODO entries from Python sources
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path('.')
+          target_paths = {
+              'luffy/deepscaler/utils.py',
+              'luffy/verl/verl/protocol.py',
+          }
+
+          all_todos = {}
+          for path in root.rglob('*.py'):
+              if '.git' in path.parts or '.github' in path.parts:
+                  continue
+              try:
+                  lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+              except Exception:
+                  continue
+
+              rel = path.as_posix()
+              items = []
+              for line_no, line in enumerate(lines, 1):
+                  match = re.search(
+                      r'#\s*TODO(?:\s*\(([^)]*)\))?\s*:?\s*(.*)',
+                      line,
+                      re.IGNORECASE,
+                  )
+                  if not match:
+                      continue
+                  author = (match.group(1) or '').strip()
+                  rest = ' '.join((match.group(2) or '').split())
+                  text = f'({author}) {rest}'.strip() if author else rest
+                  items.append((line_no, text))
+              if items:
+                  all_todos[rel] = items
+
+          def entry_key(line):
+              match = re.search(r'\*\*([^*]+):(\d+)\*\*\s*-\s*(.*)', line)
+              if not match:
+                  return None
+              return match.group(1), int(match.group(2)), match.group(3).rstrip('\n')
+
+          readme = root / 'README.md'
+          text = readme.read_text(encoding='utf-8')
+          lines = text.splitlines(keepends=True)
+
+          heading = '### 📝 Complete TODO List'
+          heading_index = next(i for i, line in enumerate(lines) if line.strip() == heading)
+          section_end = next(
+              (i for i in range(heading_index + 1, len(lines)) if lines[i].startswith('## ')),
+              len(lines),
+          )
+
+          section = lines[heading_index + 1:section_end]
+          old_entries = []
+          for line in section:
+              key = entry_key(line)
+              if key:
+                  old_entries.append((key, line))
+
+          unchanged_entries = [
+              line for key, line in old_entries
+              if key[0] not in target_paths
+          ]
+
+          new_target_entries = []
+          for rel in sorted(target_paths):
+              for line_no, text in all_todos.get(rel, []):
+                  new_target_entries.append(
+                      f'- [ ] **{rel}:{line_no}** - {text}\n'
+                  )
+
+          if len(new_target_entries) != 18:
+              print(f'Parsed {len(new_target_entries)} target TODO entries; expected 18.', file=sys.stderr)
+              print('\n'.join(new_target_entries), file=sys.stderr)
+              sys.exit(1)
+
+          def sort_key(line):
+              key = entry_key(line)
+              return (key[0], key[1]) if key else ('\uffff', 10**9)
+
+          ordered_entries = sorted(unchanged_entries + new_target_entries, key=sort_key)
+          new_text = ''.join(
+              lines[:heading_index]
+              + [lines[heading_index], '\n']
+              + ordered_entries
+              + ['\n']
+              + lines[section_end:]
+          )
+
+          if heading not in new_text:
+              sys.exit('README heading was not preserved')
+
+          readme.write_text(new_text, encoding='utf-8')
+
+          workflow = root / '.github/workflows/sync-todo-readme.yml'
+          if workflow.exists():
+              workflow.unlink()
+
+          total_todos = sum(len(items) for items in all_todos.values())
+          print(f'Updated {len(new_target_entries)} target TODO entries; scanned {total_todos} Python TODOs.')
+          PY
+
+      - name: Commit README TODO update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all README.md .github/workflows/sync-todo-readme.yml
+          if git diff --cached --quiet; then
+            echo "No README TODO changes to commit."
+          else
+            git commit -m "docs: update README TODO list"
+            git push origin HEAD:dev
+          fi
